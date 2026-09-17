@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -37,8 +38,14 @@ def _unquote(value: str) -> str:
 
 
 def _parse_card_uids(spool: dict) -> List[str]:
-    raw = _unquote((spool.get("extra") or {}).get("card_uids") or "")
-    return [u.strip().upper() for u in raw.split(",") if u.strip()]
+    extra = spool.get("extra") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    raw = _unquote(extra.get("card_uids") or extra.get("nfc_id") or "")
+    return [u.strip().upper().replace(":", "") for u in raw.split(",") if u.strip()]
 
 
 def _parse_variant(vendor: str, filament: dict) -> str:
@@ -66,19 +73,6 @@ class SpoolLink:
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
 
-        self._spool_usage: Dict[int, float] = {}
-        self._last_filament_used = 0.0
-        
-        from .history import HistoryFieldData
-        self.spool_usage_history = HistoryFieldData(
-            "spool_usage", "spoollink", "Spool usage breakdown (mm)", "value",
-            reset_callback=self._on_history_reset
-        )
-        history = self.server.lookup_component("history", None)
-        if history is not None:
-            history.register_auxiliary_field(self.spool_usage_history)
-
-
         self.server.register_remote_method(RESOLVE_METHOD, self._resolve_spool)
         self.server.register_event_handler(
             "server:klippy_ready", self._handle_klippy_ready)
@@ -86,11 +80,6 @@ class SpoolLink:
             "server:klippy_disconnect", self._handle_klippy_disconnect)
         self.server.register_event_handler(
             "spoolman:active_spool_set", self._handle_active_spool_set)
-
-    
-    def _on_history_reset(self) -> None:
-        self._spool_usage.clear()
-        self._last_filament_used = 0.0
 
     async def component_init(self) -> None:
         logging.info(
@@ -108,7 +97,6 @@ class SpoolLink:
             "filament_detect": None,
             "print_task_config": ["filament_spool_id"],
             "toolhead": ["extruder"],
-            "print_stats": ["filament_used", "state"],
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
 
@@ -128,20 +116,6 @@ class SpoolLink:
             self._fire(self._sync_active_spool())
 
     def _handle_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
-        
-        ps = status.get("print_stats")
-        if ps is not None:
-            if "filament_used" in ps:
-                current_used = ps["filament_used"]
-                delta = current_used - self._last_filament_used
-                if delta > 0 and self._active_spool_id is not None:
-                    self._spool_usage[self._active_spool_id] = self._spool_usage.get(self._active_spool_id, 0.0) + delta
-                self._last_filament_used = current_used
-            if "state" in ps:
-                state = ps["state"]
-                if state in ["complete", "cancelled"]:
-                    self.spool_usage_history.tracker.update(dict(self._spool_usage))
-
         th = status.get("toolhead")
         if th is not None:
             extruder = th.get("extruder")
@@ -176,10 +150,17 @@ class SpoolLink:
             return
         self._channel_event_times[ch] = event_time
         uid_hex = self._uid_to_hex(info.get("CARD_UID"))
+        tray_uid = info.get("TRAY_UID") or ""
         if uid_hex:
+            self._channel_card_uids = getattr(self, '_channel_card_uids', {})
+            if uid_hex == self._channel_card_uids.get(ch):
+                if self._ptc_spool_ids and ch < len(self._ptc_spool_ids) and self._ptc_spool_ids[ch] != 0:
+                    return
+            self._channel_card_uids[ch] = uid_hex
+
             logging.info("[spoollink] ch%d: detected at %.3f (card %s), resolving",
                          ch, event_time, uid_hex)
-            self._fire(self._resolve_spool(ch, card_uid=uid_hex))
+            self._fire(self._resolve_spool(ch, card_uid=uid_hex, tray_uid=tray_uid))
 
     # -- Active spool sync --------------------------------------------------
 
@@ -211,14 +192,14 @@ class SpoolLink:
         logging.info("[spoollink] set active spool: channel=%d spool_id=%s → %s",
                      channel, self._active_spool_id, spool_id)
         self._active_spool_id = spool_id
-        spool_mgr = (self.server.lookup_component("filaman", None) or 
-                     self.server.lookup_component("spoolman", None))
-        if spool_mgr is not None:
-            try:
-                spool_mgr.set_active_spool(spool_id or None)
-            except Exception:
-                self._active_spool_id = None
-                raise
+        spoolman = self.server.lookup_component("spoolman", None)
+        if spoolman is None:
+            return
+        try:
+            spoolman.set_active_spool(spool_id or None)
+        except Exception:
+            self._active_spool_id = None
+            raise
 
     # -- Klipper push -------------------------------------------------------
 
@@ -358,14 +339,32 @@ class SpoolLink:
             return None
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
-    async def _spoolman_find_by_card(self, card_uid: str) -> List[dict]:
+
+
+    async def _spoolman_find_by_card(self, card_uid: str,
+                                     tray_uid: Optional[str] = None) -> List[dict]:
         resp = await self.http_client.get(
             f"{self._spoolman_url}/api/v1/spool?limit=1000", enable_cache=False)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
         spools = resp.json()
         uid_upper = card_uid.upper()
-        return [s for s in spools if uid_upper in _parse_card_uids(s)]
+        tray_upper = tray_uid.upper().replace(":", "") if tray_uid else None
+        matches = []
+        for s in spools:
+            parsed = [u.replace(":", "").upper() for u in _parse_card_uids(s)]
+            if uid_upper in parsed:
+                matches.append(s)
+            elif tray_upper and tray_upper in parsed:
+                matches.append(s)
+            else:
+                extra = s.get("extra") or {}
+                for k in ("tray_uid", "rfid_uid", "nfc_spool_uuid", "tag"):
+                    val = _unquote(extra.get(k) or "").upper().replace(":", "")
+                    if val and (val == uid_upper or (tray_upper and val == tray_upper)):
+                        matches.append(s)
+                        break
+        return matches
 
     async def _spoolman_patch_card_uids(self, spool: dict, uids: List[str]) -> dict:
         encoded = json.dumps(",".join(uids))
@@ -376,12 +375,19 @@ class SpoolLink:
             return resp.json()
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
-    async def _spoolman_add_card_uid(self, spool: dict, card_uid: str) -> dict:
-        uid_upper = card_uid.upper()
+    async def _spoolman_add_card_uid(self, spool: dict, card_uid: str,
+                                     tray_uid: Optional[str] = None) -> dict:
+        to_add = [card_uid.upper()]
+        if tray_uid:
+            to_add.append(tray_uid.upper().replace(":", ""))
         existing = _parse_card_uids(spool)
-        if uid_upper in existing:
+        new_uids = list(existing)
+        for u in to_add:
+            if u not in new_uids:
+                new_uids.append(u)
+        if new_uids == existing:
             return spool
-        return await self._spoolman_patch_card_uids(spool, existing + [uid_upper])
+        return await self._spoolman_patch_card_uids(spool, new_uids)
 
     async def _spoolman_remove_card_uid(self, spool: dict, card_uid: str) -> dict:
         uid_upper = card_uid.upper()
@@ -394,7 +400,7 @@ class SpoolLink:
     # -- Resolution ---------------------------------------------------------
 
     async def _resolve_spool(self, channel: int, spool_id: Any = None,
-                             card_uid: Any = None) -> None:
+                             card_uid: Any = None, tray_uid: Optional[str] = None) -> None:
         spool_id = spool_id or None
         card_uid = card_uid or None
         if channel is None:
@@ -405,6 +411,9 @@ class SpoolLink:
         spool_by_id = None
         spools_by_card: List[dict] = []
         spoolman_ok = True
+        if tray_uid:
+            logging.info("[spoollink] ch%d: resolved Bambu Tray UID %s for card %s",
+                         channel, tray_uid, card_uid)
 
         if spool_id is not None:
             try:
@@ -417,7 +426,7 @@ class SpoolLink:
         if card_uid is not None:
             try:
                 spools_by_card = await self._retry(
-                    self._spoolman_find_by_card, card_uid)
+                    self._spoolman_find_by_card, card_uid, tray_uid=tray_uid)
             except Exception as e:
                 logging.error("[spoollink] ch%d: fetch by card failed: %s",
                               channel, e)
@@ -439,6 +448,8 @@ class SpoolLink:
         if spool is None:
             if card_uid is not None and not spoolman_ok:
                 spool = self._load_cache(card_uid)
+                if spool is None and tray_uid:
+                    spool = self._load_cache(tray_uid)
                 if spool is not None:
                     logging.warning("[spoollink] ch%d: using cached data for card %s",
                                     channel, card_uid)
@@ -447,6 +458,8 @@ class SpoolLink:
                 if card_uid is not None:
                     if spoolman_ok:
                         self._delete_cache(card_uid)
+                        if tray_uid:
+                            self._delete_cache(tray_uid)
                     await self._spoollink_set(
                         channel,
                         f"SpoolLink: E{channel + 1} no spool found for card {card_uid}",
@@ -457,9 +470,10 @@ class SpoolLink:
             if card_uid.upper() not in _parse_card_uids(spool_by_id):
                 try:
                     spool = await self._retry(
-                        self._spoolman_add_card_uid, spool_by_id, card_uid)
-                    logging.info("[spoollink] ch%d: bound spool %s to card %s",
-                                 channel, spool_by_id["id"], card_uid)
+                        self._spoolman_add_card_uid, spool_by_id, card_uid,
+                        tray_uid=tray_uid)
+                    logging.info("[spoollink] ch%d: bound spool %s to card %s (tray %s)",
+                                 channel, spool_by_id["id"], card_uid, tray_uid or "none")
                 except Exception as e:
                     logging.error("[spoollink] ch%d: bind spool %s failed: %s",
                                   channel, spool_by_id["id"], e)
@@ -479,6 +493,8 @@ class SpoolLink:
 
         if card_uid is not None and spoolman_ok:
             self._save_cache(card_uid, spool)
+            if tray_uid:
+                self._save_cache(tray_uid, spool)
 
         await self._apply_spool(channel, spool, card_uid or "", cached=cached)
 
