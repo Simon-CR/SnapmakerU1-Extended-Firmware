@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
@@ -31,25 +31,104 @@ SET_ENDPOINT = "spoollink/set"
 
 
 def _unquote(value: str) -> str:
-    s = value.strip()
+    s = str(value).strip()
     if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
         s = s[1:-1]
     return s
 
 
-def _parse_card_uids(spool: dict) -> List[str]:
+def _normalize_uid(val: Any) -> str:
+    if not val:
+        return ""
+    if isinstance(val, (list, tuple)):
+        if all(b == 0 for b in val):
+            return ""
+        return "".join(f"{b:02X}" for b in val)
+    s = str(val).strip()
+    s = _unquote(s)
+    return re.sub(r'["\':\s\-_]', "", s).upper()
+
+
+def _is_cascade_uid(norm: str) -> bool:
+    # 4 bytes (8 hex characters) starting with 88 is an ISO14443-A Cascade Tag (CT) fragment
+    return len(norm) == 8 and norm.startswith("88")
+
+
+def _extract_all_uids(spool: dict) -> Set[str]:
+    uids: Set[str] = set()
+    for k in ("rfid_uid", "rfid_uid_2", "bambu_tray_uid"):
+        val = spool.get(k)
+        if val:
+            norm = _normalize_uid(val)
+            if norm:
+                uids.add(norm)
+
+    custom = spool.get("custom_fields") or {}
+    if isinstance(custom, str):
+        try:
+            custom = json.loads(custom)
+        except Exception:
+            custom = {}
+    if isinstance(custom, dict):
+        for k, v in custom.items():
+            if k in ("card_uids", "rfid_uid", "previous_tag", "bambu_tray_uid", "tray_uid", "nfc_id", "tag"):
+                if isinstance(v, str):
+                    for part in _unquote(v).split(","):
+                        norm = _normalize_uid(part)
+                        if norm:
+                            uids.add(norm)
+                elif isinstance(v, list):
+                    for item in v:
+                        norm = _normalize_uid(item)
+                        if norm:
+                            uids.add(norm)
+
     extra = spool.get("extra") or {}
     if isinstance(extra, str):
         try:
             extra = json.loads(extra)
         except Exception:
             extra = {}
-    raw = _unquote(extra.get("card_uids") or extra.get("nfc_id") or "")
-    return [u.strip().upper().replace(":", "") for u in raw.split(",") if u.strip()]
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if k in ("card_uids", "nfc_id", "rfid_uid", "tray_uid", "bambu_tray_uid", "nfc_spool_uuid", "tag"):
+                if isinstance(v, str):
+                    for part in _unquote(v).split(","):
+                        norm = _normalize_uid(part)
+                        if norm:
+                            uids.add(norm)
+                elif isinstance(v, list):
+                    for item in v:
+                        norm = _normalize_uid(item)
+                        if norm:
+                            uids.add(norm)
+    return uids
+
+
+def _parse_card_uids(spool: dict) -> List[str]:
+    return list(_extract_all_uids(spool))
 
 
 def _parse_variant(vendor: str, filament: dict) -> str:
-    variant = _unquote((filament.get("extra") or {}).get("variant") or "")
+    extra = filament.get("extra") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except Exception:
+            extra = {}
+    variant = _unquote(extra.get("variant") or "")
+    if not variant:
+        custom = filament.get("custom_fields") or {}
+        if isinstance(custom, str):
+            try:
+                custom = json.loads(custom)
+            except Exception:
+                custom = {}
+        if isinstance(custom, dict):
+            variant = _unquote(custom.get("variant") or "")
+    if not variant and filament.get("material_subgroup"):
+        sub = filament.get("material_subgroup", "")
+        variant = sub.capitalize() if sub.lower() != "basic" else ""
     if variant:
         return variant
     return "Basic" if vendor.lower() == "snapmaker" else ""
@@ -62,6 +141,10 @@ class SpoolLink:
         if "://" not in url:
             url = "http://" + url
         self._spoolman_url = url
+        self._api_key: Optional[str] = config.get("api_key", None)
+        self._is_filaman: bool = bool(self._api_key or "filaman" in url.lower())
+        self._last_unresolved: Dict[int, str] = {}
+        self._channel_card_uids: Dict[int, str] = {}
         self._cache_dir: Optional[str] = config.get("cache_dir", None)
         self._force_generic_vendor = config.getboolean(
             "force_generic_vendor", False)
@@ -72,6 +155,7 @@ class SpoolLink:
         self._toolhead_extruder: str = "extruder"
         self._ptc_spool_ids: List[int] = []
         self._active_spool_id: Optional[int] = None
+        self._printer_state: str = "standby"
 
         self.server.register_remote_method(RESOLVE_METHOD, self._resolve_spool)
         self.server.register_event_handler(
@@ -83,11 +167,12 @@ class SpoolLink:
 
     async def component_init(self) -> None:
         logging.info(
-            "spoollink starting (spoolman: %s, cache: %s, "
+            "spoollink starting (server: %s, is_filaman: %s, cache: %s, "
             "force generic vendor: %s)",
-            self._spoolman_url, self._cache_dir or "disabled",
+            self._spoolman_url, self._is_filaman, self._cache_dir or "disabled",
             self._force_generic_vendor)
-        await self._ensure_fields()
+        if not self._is_filaman:
+            await self._ensure_fields()
 
     # -- Klippy lifecycle ---------------------------------------------------
 
@@ -97,14 +182,21 @@ class SpoolLink:
             "filament_detect": None,
             "print_task_config": ["filament_spool_id"],
             "toolhead": ["extruder"],
+            "print_stats": ["state"],
         }, self._handle_status_update, {})
         self._handle_status_update(status, 0.)
 
     def _handle_klippy_disconnect(self) -> None:
         logging.info("[spoollink] Klippy disconnected")
         self._channel_event_times = {}
+        self._channel_card_uids = {}
+        self._last_unresolved = {}
         self._ptc_spool_ids = []
         self._active_spool_id = None
+        self._printer_state = "standby"
+
+    def _is_printing(self) -> bool:
+        return self._printer_state.lower() in ("printing", "paused")
 
     # -- Remote method / subscription callbacks -----------------------------
 
@@ -116,6 +208,14 @@ class SpoolLink:
             self._fire(self._sync_active_spool())
 
     def _handle_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
+        ps = status.get("print_stats")
+        if ps is not None:
+            state = ps.get("state")
+            if state is not None and state != self._printer_state:
+                logging.info("[spoollink] printer state: %s → %s",
+                             self._printer_state, state)
+                self._printer_state = state
+
         th = status.get("toolhead")
         if th is not None:
             extruder = th.get("extruder")
@@ -151,16 +251,31 @@ class SpoolLink:
         self._channel_event_times[ch] = event_time
         uid_hex = self._uid_to_hex(info.get("CARD_UID"))
         tray_uid = info.get("TRAY_UID") or ""
-        if uid_hex:
-            self._channel_card_uids = getattr(self, '_channel_card_uids', {})
-            if uid_hex == self._channel_card_uids.get(ch):
-                if self._ptc_spool_ids and ch < len(self._ptc_spool_ids) and self._ptc_spool_ids[ch] != 0:
-                    return
-            self._channel_card_uids[ch] = uid_hex
 
-            logging.info("[spoollink] ch%d: detected at %.3f (card %s), resolving",
-                         ch, event_time, uid_hex)
-            self._fire(self._resolve_spool(ch, card_uid=uid_hex, tray_uid=tray_uid))
+        if not uid_hex:
+            # Card removed or cleared
+            self._channel_card_uids.pop(ch, None)
+            self._last_unresolved.pop(ch, None)
+            return
+
+        # Ignore invalid truncated ISO14443-A cascade tag fragments (e.g. 8804A27C)
+        if _is_cascade_uid(uid_hex):
+            logging.warning("[spoollink] ch%d: ignoring truncated ISO14443-A cascade UID %s",
+                            ch, uid_hex)
+            return
+
+        # Suppress duplicate resolutions and console error spam
+        if uid_hex == self._channel_card_uids.get(ch):
+            if self._ptc_spool_ids and ch < len(self._ptc_spool_ids) and self._ptc_spool_ids[ch] != 0:
+                return
+            if self._last_unresolved.get(ch) == uid_hex:
+                return
+
+        self._channel_card_uids[ch] = uid_hex
+
+        logging.info("[spoollink] ch%d: detected at %.3f (card %s), resolving",
+                     ch, event_time, uid_hex)
+        self._fire(self._resolve_spool(ch, card_uid=uid_hex, tray_uid=tray_uid))
 
     # -- Active spool sync --------------------------------------------------
 
@@ -251,7 +366,7 @@ class SpoolLink:
     def _cache_path(self, card_uid: str) -> Optional[str]:
         if not self._cache_dir:
             return None
-        return os.path.join(self._cache_dir, f"{card_uid.upper()}.json")
+        return os.path.join(self._cache_dir, f"{_normalize_uid(card_uid)}.json")
 
     def _load_cache(self, card_uid: str) -> Optional[dict]:
         path = self._cache_path(card_uid)
@@ -293,16 +408,19 @@ class SpoolLink:
         except Exception as e:
             logging.warning("[spoollink] cache delete failed for %s: %s", card_uid, e)
 
-    # -- Spoolman REST ------------------------------------------------------
+    # -- FilaMan / Spoolman REST --------------------------------------------
 
     async def _ensure_fields(self) -> None:
         await self._ensure_field("spool", "card_uids", "Card UIDs")
         await self._ensure_field("filament", "variant", "Variant")
 
     async def _ensure_field(self, entity_type: str, key: str, name: str) -> None:
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"ApiKey {self._api_key}"
         base = f"{self._spoolman_url}/api/v1/field/{entity_type}"
         try:
-            resp = await self.http_client.get(base, enable_cache=False)
+            resp = await self.http_client.get(base, headers=headers, enable_cache=False)
             if resp.status_code != 200:
                 logging.warning(
                     "[spoollink] could not read custom fields for %s (HTTP %s)",
@@ -318,7 +436,7 @@ class SpoolLink:
                 "order": 1,
                 "default_value": json.dumps(""),
             }
-            resp = await self.http_client.post(f"{base}/{key}", body=body)
+            resp = await self.http_client.post(f"{base}/{key}", body=body, headers=headers)
             if resp.status_code in (200, 201):
                 logging.info("[spoollink] field %s/%s: created", entity_type, key)
             else:
@@ -331,71 +449,145 @@ class SpoolLink:
                 entity_type, key, e)
 
     async def _spoolman_get_by_id(self, spool_id: int) -> Optional[dict]:
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"ApiKey {self._api_key}"
+        endpoint = f"/api/v1/spools/{spool_id}" if self._is_filaman else f"/api/v1/spool/{spool_id}"
         resp = await self.http_client.get(
-            f"{self._spoolman_url}/api/v1/spool/{spool_id}", enable_cache=False)
+            f"{self._spoolman_url}{endpoint}", headers=headers, enable_cache=False)
+        if resp.status_code == 404:
+            fallbacks = ["/spoolman/api/v1/spool", "/api/v1/spool", "/api/v1/spools"]
+            for fb in fallbacks:
+                alt = f"{fb}/{spool_id}"
+                if alt == endpoint:
+                    continue
+                resp = await self.http_client.get(
+                    f"{self._spoolman_url}{alt}", headers=headers, enable_cache=False)
+                if resp.status_code == 200:
+                    break
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 404:
             return None
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
-
-
     async def _spoolman_find_by_card(self, card_uid: str,
                                      tray_uid: Optional[str] = None) -> List[dict]:
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"ApiKey {self._api_key}"
+
+        is_filaman = self._is_filaman
+        primary_endpoint = "/api/v1/spools?limit=1000" if is_filaman else "/api/v1/spool?limit=1000"
+
         resp = await self.http_client.get(
-            f"{self._spoolman_url}/api/v1/spool?limit=1000", enable_cache=False)
+            f"{self._spoolman_url}{primary_endpoint}",
+            headers=headers, enable_cache=False)
+
+        if resp.status_code == 404:
+            fallbacks = ["/spoolman/api/v1/spool", "/api/v1/spool", "/api/v1/spools?limit=1000"]
+            for fb in fallbacks:
+                if fb == primary_endpoint:
+                    continue
+                resp = await self.http_client.get(
+                    f"{self._spoolman_url}{fb}",
+                    headers=headers, enable_cache=False)
+                if resp.status_code == 200:
+                    break
+
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
-        spools = resp.json()
-        uid_upper = card_uid.upper()
-        tray_upper = tray_uid.upper().replace(":", "") if tray_uid else None
+
+        data = resp.json()
+        if isinstance(data, dict):
+            spools = data.get("items", [])
+            total = data.get("total", len(spools))
+            page = data.get("page", 1)
+            page_size = data.get("page_size", len(spools))
+            while len(spools) < total and page * page_size < total:
+                page += 1
+                next_resp = await self.http_client.get(
+                    f"{self._spoolman_url}/api/v1/spools?page={page}&page_size={page_size}",
+                    headers=headers, enable_cache=False)
+                if next_resp.status_code == 200:
+                    next_data = next_resp.json()
+                    if isinstance(next_data, dict):
+                        spools.extend(next_data.get("items", []))
+                    else:
+                        break
+                else:
+                    break
+        elif isinstance(data, list):
+            spools = data
+        else:
+            spools = []
+
+        norm_card = _normalize_uid(card_uid)
+        norm_tray = _normalize_uid(tray_uid) if tray_uid else ""
+
         matches = []
         for s in spools:
-            parsed = [u.replace(":", "").upper() for u in _parse_card_uids(s)]
-            if uid_upper in parsed:
+            if not isinstance(s, dict):
+                continue
+            all_uids = _extract_all_uids(s)
+            if norm_card and norm_card in all_uids:
                 matches.append(s)
-            elif tray_upper and tray_upper in parsed:
+            elif norm_tray and norm_tray in all_uids:
                 matches.append(s)
-            else:
-                extra = s.get("extra") or {}
-                for k in ("tray_uid", "rfid_uid", "nfc_spool_uuid", "tag"):
-                    val = _unquote(extra.get(k) or "").upper().replace(":", "")
-                    if val and (val == uid_upper or (tray_upper and val == tray_upper)):
-                        matches.append(s)
-                        break
+
         return matches
 
     async def _spoolman_patch_card_uids(self, spool: dict, uids: List[str]) -> dict:
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"ApiKey {self._api_key}"
+        spool_id = spool["id"]
+        if self._is_filaman:
+            body: Dict[str, Any] = {
+                "custom_fields": {"card_uids": ",".join(uids)}
+            }
+            if uids and not spool.get("rfid_uid"):
+                body["rfid_uid"] = uids[0]
+            resp = await self.http_client.request(
+                "PATCH", f"{self._spoolman_url}/api/v1/spools/{spool_id}",
+                body=body, headers=headers)
+            if resp.status_code in (200, 204):
+                return resp.json() if resp.status_code == 200 else spool
+            if resp.status_code != 404:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
+
         encoded = json.dumps(",".join(uids))
         resp = await self.http_client.request(
-            "PATCH", f"{self._spoolman_url}/api/v1/spool/{spool['id']}",
-            body={"extra": {"card_uids": encoded}})
-        if resp.status_code == 200:
-            return resp.json()
+            "PATCH", f"{self._spoolman_url}/api/v1/spool/{spool_id}",
+            body={"extra": {"card_uids": encoded}}, headers=headers)
+        if resp.status_code in (200, 204):
+            return resp.json() if resp.status_code == 200 else spool
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text()}")
 
     async def _spoolman_add_card_uid(self, spool: dict, card_uid: str,
                                      tray_uid: Optional[str] = None) -> dict:
-        to_add = [card_uid.upper()]
+        norm_card = _normalize_uid(card_uid)
+        to_add = [norm_card]
         if tray_uid:
-            to_add.append(tray_uid.upper().replace(":", ""))
+            norm_tray = _normalize_uid(tray_uid)
+            if norm_tray:
+                to_add.append(norm_tray)
         existing = _parse_card_uids(spool)
         new_uids = list(existing)
         for u in to_add:
             if u not in new_uids:
                 new_uids.append(u)
-        if new_uids == existing:
+        if set(new_uids) == set(existing):
             return spool
         return await self._spoolman_patch_card_uids(spool, new_uids)
 
     async def _spoolman_remove_card_uid(self, spool: dict, card_uid: str) -> dict:
-        uid_upper = card_uid.upper()
+        norm_card = _normalize_uid(card_uid)
         existing = _parse_card_uids(spool)
-        if uid_upper not in existing:
+        if norm_card not in existing:
             return spool
         return await self._spoolman_patch_card_uids(
-            spool, [u for u in existing if u != uid_upper])
+            spool, [u for u in existing if u != norm_card])
 
     # -- Resolution ---------------------------------------------------------
 
@@ -406,6 +598,12 @@ class SpoolLink:
         if channel is None:
             logging.error("[spoollink] resolve_spool: missing channel")
             return
+
+        if card_uid and _is_cascade_uid(_normalize_uid(card_uid)):
+            logging.warning("[spoollink] ch%d: ignoring truncated ISO14443-A cascade UID %s",
+                            channel, card_uid)
+            return
+
         logging.debug("[spoollink] ch%d: resolve spool_id=%s card_uid=%s",
                       channel, spool_id, card_uid)
         spool_by_id = None
@@ -433,7 +631,7 @@ class SpoolLink:
                 spoolman_ok = False
 
         if len(spools_by_card) > 1:
-            ids = ", ".join(f"#{s['id']}" for s in spools_by_card)
+            ids = ", ".join(f"#{s.get('id')}" for s in spools_by_card)
             logging.warning("[spoollink] ch%d: card %s assigned to multiple spools: %s",
                             channel, card_uid, ids)
             await self._spoollink_set(
@@ -455,19 +653,41 @@ class SpoolLink:
                                     channel, card_uid)
             cached = spool is not None and not spoolman_ok
             if spool is None:
+                # Active print protection: never unbind an existing mapped spool due to a transient scan issue
+                current_spool_id = (self._ptc_spool_ids[channel]
+                                    if channel < len(self._ptc_spool_ids) else 0) or 0
+                if self._is_printing() and current_spool_id != 0:
+                    logging.warning(
+                        "[spoollink] ch%d: card %s unresolved during active print; "
+                        "preserving existing spool #%s to prevent unbind",
+                        channel, card_uid, current_spool_id)
+                    return
+
                 if card_uid is not None:
                     if spoolman_ok:
                         self._delete_cache(card_uid)
                         if tray_uid:
                             self._delete_cache(tray_uid)
-                    await self._spoollink_set(
-                        channel,
-                        f"SpoolLink: E{channel + 1} no spool found for card {card_uid}",
-                        status="error")
+                    if self._last_unresolved.get(channel) == card_uid:
+                        logging.debug(
+                            "[spoollink] ch%d: card %s still unresolved (suppressing repeat notice)",
+                            channel, card_uid)
+                    else:
+                        self._last_unresolved[channel] = card_uid
+                        logging.warning("[spoollink] ch%d: no spool found for card %s",
+                                        channel, card_uid)
+                        await self._spoollink_set(
+                            channel,
+                            f"SpoolLink: E{channel + 1} no spool found for card {card_uid}",
+                            status="error")
                 return
 
+        # Spool found / resolved! Clear unresolved state for channel
+        self._last_unresolved.pop(channel, None)
+
         if card_uid is not None and spool_by_id is not None:
-            if card_uid.upper() not in _parse_card_uids(spool_by_id):
+            norm_card = _normalize_uid(card_uid)
+            if norm_card not in _extract_all_uids(spool_by_id):
                 try:
                     spool = await self._retry(
                         self._spoolman_add_card_uid, spool_by_id, card_uid,
@@ -479,17 +699,17 @@ class SpoolLink:
                                   channel, spool_by_id["id"], e)
 
             for stale in spools_by_card:
-                if stale["id"] == spool_by_id["id"]:
+                if stale.get("id") == spool_by_id.get("id"):
                     continue
                 try:
                     await self._retry(
                         self._spoolman_remove_card_uid, stale, card_uid)
                     logging.info("[spoollink] ch%d: unbound card %s from spool %s",
-                                 channel, card_uid, stale["id"])
+                                 channel, card_uid, stale.get("id"))
                 except Exception as e:
                     logging.error(
                         "[spoollink] ch%d: unbind card %s from spool %s failed: %s",
-                        channel, card_uid, stale["id"], e)
+                        channel, card_uid, stale.get("id"), e)
 
         if card_uid is not None and spoolman_ok:
             self._save_cache(card_uid, spool)
@@ -502,8 +722,8 @@ class SpoolLink:
                            cached: bool = False) -> None:
         spool_id = spool.get("id", 0)
         filament = spool.get("filament", {})
-        material = filament.get("material", "PLA")
-        vendor = (filament.get("vendor") or {}).get("name", "Generic")
+        material = filament.get("material") or filament.get("material_type") or "PLA"
+        vendor = (filament.get("vendor") or filament.get("manufacturer") or {}).get("name", "Generic")
         variant = _parse_variant(vendor, filament)
 
         if (self._force_generic_vendor
@@ -512,10 +732,17 @@ class SpoolLink:
             variant = ""
 
         raw_multi = filament.get("multi_color_hexes") or ""
-        colors = [c.strip().upper()[:6] for c in raw_multi.split(",") if c.strip()]
-        color_hex = colors[0] if colors else (filament.get("color_hex") or "FFFFFF")[:6].upper()
+        colors = [c.strip().upper().lstrip("#")[:6] for c in raw_multi.split(",") if c.strip()]
+        if not colors and filament.get("colors"):
+            for c in filament.get("colors", []):
+                if isinstance(c, dict):
+                    hex_val = (c.get("color") or {}).get("hex_code") or ""
+                    hex_clean = hex_val.strip().upper().lstrip("#")[:6]
+                    if hex_clean:
+                        colors.append(hex_clean)
+        color_hex = colors[0] if colors else (filament.get("color_hex") or "FFFFFF").strip().upper().lstrip("#")[:6]
 
-        color_list = colors or [color_hex]
+        color_list = list(colors) or [color_hex]
         color_nums = len(color_list)
         while len(color_list) < 5:
             color_list.append("000000")
