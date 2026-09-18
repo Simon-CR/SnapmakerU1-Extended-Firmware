@@ -54,54 +54,55 @@ def _is_cascade_uid(norm: str) -> bool:
     return len(norm) == 8 and norm.startswith("88")
 
 
-def _extract_all_uids(spool: dict) -> Set[str]:
+def _extract_primary_uids(spool: dict) -> Set[str]:
     uids: Set[str] = set()
-    for k in ("rfid_uid", "rfid_uid_2", "bambu_tray_uid"):
+    for k in ("rfid_uid", "rfid_uid_2"):
         val = spool.get(k)
         if val:
             norm = _normalize_uid(val)
             if norm:
                 uids.add(norm)
-
-    custom = spool.get("custom_fields") or {}
-    if isinstance(custom, str):
-        try:
-            custom = json.loads(custom)
-        except Exception:
-            custom = {}
-    if isinstance(custom, dict):
-        for k, v in custom.items():
-            if k in ("card_uids", "rfid_uid", "previous_tag", "bambu_tray_uid", "tray_uid", "nfc_id", "tag"):
-                if isinstance(v, str):
-                    for part in _unquote(v).split(","):
+    for field in ("custom_fields", "extra"):
+        custom = spool.get(field) or {}
+        if isinstance(custom, str):
+            try:
+                custom = json.loads(custom)
+            except Exception:
+                custom = {}
+        if isinstance(custom, dict):
+            for k in ("rfid_uid", "rfid_uid_2"):
+                val = custom.get(k)
+                if isinstance(val, str):
+                    for part in _unquote(val).split(","):
                         norm = _normalize_uid(part)
                         if norm:
                             uids.add(norm)
-                elif isinstance(v, list):
-                    for item in v:
-                        norm = _normalize_uid(item)
-                        if norm:
-                            uids.add(norm)
+    return uids
 
-    extra = spool.get("extra") or {}
-    if isinstance(extra, str):
-        try:
-            extra = json.loads(extra)
-        except Exception:
-            extra = {}
-    if isinstance(extra, dict):
-        for k, v in extra.items():
-            if k in ("card_uids", "nfc_id", "rfid_uid", "tray_uid", "bambu_tray_uid", "nfc_spool_uuid", "tag"):
-                if isinstance(v, str):
-                    for part in _unquote(v).split(","):
-                        norm = _normalize_uid(part)
-                        if norm:
-                            uids.add(norm)
-                elif isinstance(v, list):
-                    for item in v:
-                        norm = _normalize_uid(item)
-                        if norm:
-                            uids.add(norm)
+def _extract_secondary_uids(spool: dict) -> Set[str]:
+    uids: Set[str] = set()
+    for k in ("bambu_tray_uid", "card_uids"):
+        val = spool.get(k)
+        if val:
+            norm = _normalize_uid(val)
+            if norm:
+                uids.add(norm)
+    
+    for field in ("custom_fields", "extra"):
+        custom = spool.get(field) or {}
+        if isinstance(custom, str):
+            try:
+                custom = json.loads(custom)
+            except Exception:
+                custom = {}
+        if isinstance(custom, dict):
+            for k, v in custom.items():
+                if k in ("card_uids", "previous_tag", "bambu_tray_uid", "tray_uid", "nfc_id", "tag"):
+                    if isinstance(v, str):
+                        for part in _unquote(v).split(","):
+                            norm = _normalize_uid(part)
+                            if norm:
+                                uids.add(norm)
     return uids
 
 
@@ -525,17 +526,46 @@ class SpoolLink:
         norm_card = _normalize_uid(card_uid)
         norm_tray = _normalize_uid(tray_uid) if tray_uid else ""
 
-        matches = []
+        primary_matches = []
+        secondary_matches = []
         for s in spools:
             if not isinstance(s, dict):
                 continue
-            all_uids = _extract_all_uids(s)
-            if norm_card and norm_card in all_uids:
-                matches.append(s)
-            elif norm_tray and norm_tray in all_uids:
-                matches.append(s)
+            primaries = _extract_primary_uids(s)
+            secondaries = _extract_secondary_uids(s)
+            
+            if norm_card and norm_card in primaries:
+                primary_matches.append(s)
+            elif norm_tray and norm_tray in primaries:
+                primary_matches.append(s)
+            elif norm_card and norm_card in secondaries:
+                secondary_matches.append(s)
+            elif norm_tray and norm_tray in secondaries:
+                secondary_matches.append(s)
 
-        return matches
+        candidate_pool = primary_matches if primary_matches else secondary_matches
+
+        if len(candidate_pool) > 1:
+            active_candidates = []
+            for s in candidate_pool:
+                try:
+                    weight = s.get("remaining_weight")
+                    if weight is None:
+                        weight = s.get("remaining_weight_g")
+                    is_active = False
+                    if weight is None or float(weight) > 0:
+                        if not s.get("archived", False):
+                            if s.get("status_id") != 5:
+                                is_active = True
+                    if is_active:
+                        active_candidates.append(s)
+                except Exception:
+                    pass
+            
+            if active_candidates and len(active_candidates) < len(candidate_pool):
+                candidate_pool = active_candidates
+
+        return candidate_pool
 
     async def _spoolman_patch_card_uids(self, spool: dict, uids: List[str]) -> dict:
         headers = {}
@@ -687,7 +717,7 @@ class SpoolLink:
 
         if card_uid is not None and spool_by_id is not None:
             norm_card = _normalize_uid(card_uid)
-            if norm_card not in _extract_all_uids(spool_by_id):
+            if norm_card not in (_extract_primary_uids(spool_by_id) | _extract_secondary_uids(spool_by_id)):
                 try:
                     spool = await self._retry(
                         self._spoolman_add_card_uid, spool_by_id, card_uid,
@@ -722,7 +752,16 @@ class SpoolLink:
                            cached: bool = False) -> None:
         spool_id = spool.get("id", 0)
         filament = spool.get("filament", {})
-        material = filament.get("material") or filament.get("material_type") or "PLA"
+        mat_raw = (filament.get("material") or filament.get("material_type") or "PLA").strip()
+        mat_upper = mat_raw.upper().replace("_", "-")
+        if mat_upper in ("PLA-PLUS", "PLA+", "PLA PLUS", "APLA"):
+            material = "PLA"
+        elif mat_upper in ("PETG-PLUS", "PETG+", "PETG PLUS"):
+            material = "PETG"
+        elif mat_upper in ("ABS-PLUS", "ABS+", "ABS PLUS"):
+            material = "ABS"
+        else:
+            material = mat_raw
         vendor = (filament.get("vendor") or filament.get("manufacturer") or {}).get("name", "Generic")
         variant = _parse_variant(vendor, filament)
 
