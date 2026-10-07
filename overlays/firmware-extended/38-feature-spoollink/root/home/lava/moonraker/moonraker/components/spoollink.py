@@ -58,7 +58,7 @@ class SpoolLink:
         self._api_key: Optional[str] = config.get("api_key", None)
         self._cache_dir: Optional[str] = config.get("cache_dir", None)
         self._force_generic_vendor = config.getboolean(
-            "force_generic_vendor", True)
+            "force_generic_vendor", False)
         self.http_client: HttpClient = self.server.lookup_component("http_client")
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
 
