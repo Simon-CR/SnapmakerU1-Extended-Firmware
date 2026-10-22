@@ -9,8 +9,8 @@ Records initial toolhead target temperatures and selectively restores
 only toolheads that were preheated by this operation on cancel.
 Always cools toolhead to 0C on load/unload completion when idle.
 ---
- klippy/extras/filament_feed.py | 78 +++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 74 insertions(+), 4 deletions(-)
+ klippy/extras/filament_feed.py | 68 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 64 insertions(+), 4 deletions(-)
 
 --- a/klippy/extras/filament_feed.py
 +++ b/klippy/extras/filament_feed.py
@@ -41,7 +41,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
  
      def _do_feed(self, ch, action=None, stage=None, auto_mode=None):
          if ch < 0 or ch >= FEED_CHANNEL_NUMS or action == None:
-@@ -991,7 +1004,12 @@
+@@ -978,7 +991,12 @@
                          self.exception_code[ch] = 33
                          raise ValueError('logic error!')
  
@@ -55,12 +55,16 @@ Always cools toolhead to 0C on load/unload completion when idle.
  
                      # home
                      try:
-@@ -1280,3 +1298,4 @@
+@@ -1265,7 +1283,8 @@
+ 
                  finally:
                      self.gcode.run_script_from_command("M107\r\n")
 -                    self.gcode.run_script_from_command("M104 S0\r\n")
 +                    self.gcode.run_script_from_command("M104 S0 T%d A0\r\n" % (self.filament_ch[ch]))
 +                    self._preheat_orig_targets.pop(self.filament_ch[ch], None)
+ 
+             # unload
+             elif action == FEED_ACT_UNLOAD:
 @@ -1284,6 +1303,19 @@
                      try:
                          # prepare
@@ -85,11 +89,11 @@ Always cools toolhead to 0C on load/unload completion when idle.
                      except:
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
-+                        self._restore_preheated_hotends()
++                        self._quench_hotends_on_cancel()
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL)
-@@ -1358,7 +1391,8 @@
+@@ -1351,14 +1384,15 @@
  
                          # finish
                          self.toolhead.wait_moves()
@@ -99,12 +103,20 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.channel_error[ch] = FEED_OK
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FINISH)
  
+                     except:
+                         self.toolhead.wait_moves()
+                         self.channel_error_state[ch] = self.channel_state[ch]
+-                        self.gcode.run_script_from_command("M104 S0\r\n")
++                        self._quench_hotends_on_cancel()
+                         if self.channel_error[ch] == FEED_OK:
+                             self.channel_error[ch] = FEED_ERR
+                         self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL)
 @@ -1368,7 +1402,7 @@
                      self.toolhead.wait_moves()
                      self.channel_error[ch] = FEED_OK
                      self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL, True)
 -                    self.gcode.run_script_from_command("M104 S0\r\n")
-+                    self._restore_preheated_hotends()
++                    self._quench_hotends_on_cancel()
                      if self.module_exist[ch] == True and self.config['auto_mode'][ch] == True:
                          if self._port[ch].get_filament_detected() == False:
                              self._set_channel_state(ch, FEED_STA_WAIT_INSERT)
@@ -128,7 +140,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
  
                          # home
                          try:
-@@ -1433,7 +1480,8 @@
+@@ -1426,14 +1473,15 @@
                              raise ValueError('custom gcode error!')
  
                          self.toolhead.wait_moves()
@@ -138,12 +150,11 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.channel_error[ch] = FEED_OK
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FINISH)
  
-@@ -1443,7 +1491,7 @@
                      except:
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
 -                        self.gcode.run_script_from_command("M104 S0\r\n")
-+                        self._restore_preheated_hotends()
++                        self._quench_hotends_on_cancel()
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL)
@@ -151,7 +162,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.manual_feeding[ch] = False
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
-+                        self._restore_preheated_hotends()
++                        self._quench_hotends_on_cancel()
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_PREPARE_FAIL)
@@ -159,7 +170,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.toolhead.wait_moves()
                          self.manual_feeding[ch] = False
                          self.channel_error_state[ch] = self.channel_state[ch]
-+                        self._restore_preheated_hotends()
++                        self._quench_hotends_on_cancel()
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_EXTRUDE_FAIL)
@@ -167,7 +178,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.toolhead.wait_moves()
                          self.manual_feeding[ch] = False
                          self.channel_error_state[ch] = self.channel_state[ch]
-+                        self._restore_preheated_hotends()
++                        self._quench_hotends_on_cancel()
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_FLUSH_FAIL)
@@ -175,19 +186,27 @@ Always cools toolhead to 0C on load/unload completion when idle.
                          self.toolhead.wait_moves()
                      except:
                          logging.error("[feed][manual] stage: cancel, gcode error!\r\n")
-+                    self._restore_preheated_hotends()
++                    self._quench_hotends_on_cancel()
                      self._set_channel_state(ch, FEED_STA_MANUAL_FAIL, True)
                      self.channel_error_state[ch] = self.channel_state[ch]
  
-@@ -1866,2 +1918,4 @@
+@@ -1818,6 +1870,8 @@
+                         self.gcode.run_script_from_command(f"M104 S{restore_temp_from_cmd} T{self.filament_ch[channel]} A0")
+                     else:
                          self.gcode.run_script_from_command(f"M104 S{last_temp} T{self.filament_ch[channel]} A0")
 +                else:
 +                    self.gcode.run_script_from_command(f"M104 S0 T{self.filament_ch[channel]} A0\r\n")
                  if filament_entangle_detect is not None:
-@@ -1938,2 +1992,4 @@
+                     filament_entangle_detect.skip_entangle_check(False)
+                 if machine_state_manager is not None:
+@@ -1890,6 +1944,8 @@
+                         self.gcode.run_script_from_command(f"M104 S{restore_temp_from_cmd} T{self.filament_ch[channel]} A0")
+                     else:
                          self.gcode.run_script_from_command(f"M104 S{last_temp} T{self.filament_ch[channel]} A0")
 +                else:
 +                    self.gcode.run_script_from_command(f"M104 S0 T{self.filament_ch[channel]} A0\r\n")
                  if filament_entangle_detect is not None:
+                     filament_entangle_detect.skip_entangle_check(False)
+ 
 -- 
 2.47.3
