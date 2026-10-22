@@ -1,6 +1,6 @@
 --- a/fluidd.cfg
 +++ b/fluidd.cfg
-@@ -1668,45 +1668,102 @@
+@@ -1668,45 +1668,108 @@
  variable_extruder1_temp: 0
  variable_extruder2_temp: 0
  variable_extruder3_temp: 0
@@ -77,15 +77,15 @@
 +                    {% if next_extruder == 3 %}{% set p3 = True %}{% endif %}
 +                {% endif %}
 +            {% else %}
-                 AUTO_FEEDING_PREHEAT EXTRUDER={current_extruder}
-                 {% if params.NEXT_EXTRUDER is defined %}
-                     {% set next_extruder = params.NEXT_EXTRUDER | default(default_extruder) | int %}
-                     AUTO_FEEDING_PREHEAT EXTRUDER={next_extruder}
+             AUTO_FEEDING_PREHEAT EXTRUDER={current_extruder}
+             {% if params.NEXT_EXTRUDER is defined %}
+                 {% set next_extruder = params.NEXT_EXTRUDER | default(default_extruder) | int %}
+                 AUTO_FEEDING_PREHEAT EXTRUDER={next_extruder}
 +                    {% if next_extruder == 0 %}{% set p0 = True %}{% endif %}
 +                    {% if next_extruder == 1 %}{% set p1 = True %}{% endif %}
 +                    {% if next_extruder == 2 %}{% set p2 = True %}{% endif %}
 +                    {% if next_extruder == 3 %}{% set p3 = True %}{% endif %}
-                 {% endif %}
+             {% endif %}
 -            {% set extruder_temps = [extruder0_temp, extruder1_temp, extruder2_temp, extruder3_temp] %}
 -            {% set restore_temp = extruder_temps[current_extruder] %}
 +            {% endif %}

@@ -55,7 +55,7 @@ Always cools toolhead to 0C on load/unload completion when idle.
  
                      # home
                      try:
-@@ -1280,2 +1298,3 @@
+@@ -1280,3 +1298,4 @@
                  finally:
                      self.gcode.run_script_from_command("M107\r\n")
 -                    self.gcode.run_script_from_command("M104 S0\r\n")
