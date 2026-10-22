@@ -1,6 +1,6 @@
 --- a/fluidd.cfg
 +++ b/fluidd.cfg
-@@ -1668,45 +1668,106 @@
+@@ -1668,45 +1668,102 @@
  variable_extruder1_temp: 0
  variable_extruder2_temp: 0
  variable_extruder3_temp: 0
@@ -62,10 +62,6 @@
          {% if doing == False %}
              {action_raise_error('{"coded": "0002-0531-0000-0024", "msg": "auto feeding batch has not yet begun or has already ended", "action": "none"}')}
          {% else %}
--            AUTO_FEEDING_PREHEAT EXTRUDER={current_extruder}
--            {% if params.NEXT_EXTRUDER is defined %}
--                {% set next_extruder = params.NEXT_EXTRUDER | default(default_extruder) | int %}
--                AUTO_FEEDING_PREHEAT EXTRUDER={next_extruder}
 +            {% set p0 = True if current_extruder == 0 else preheated_extruders[0] %}
 +            {% set p1 = True if current_extruder == 1 else preheated_extruders[1] %}
 +            {% set p2 = True if current_extruder == 2 else preheated_extruders[2] %}
@@ -96,17 +92,13 @@
 +            {% set is_unload = params.UNLOAD | default(0) | int == 1 %}
 +            {% set raw_restore = orig_targets[current_extruder] | default(0) | int %}
 +            {% set restore_temp = 0 if is_unload else (0 if (raw_restore == preheat_temp or raw_restore in [130, 150, 170]) else raw_restore) %}
-+            {% if is_unload %}
-+                {% if current_extruder == 0 %}{% set p0 = False %}{% endif %}
-+                {% if current_extruder == 1 %}{% set p1 = False %}{% endif %}
-+                {% if current_extruder == 2 %}{% set p2 = False %}{% endif %}
-+                {% if current_extruder == 3 %}{% set p3 = False %}{% endif %}
-+            {% endif %}
++            {% if current_extruder == 0 %}{% set p0 = False %}{% endif %}
++            {% if current_extruder == 1 %}{% set p1 = False %}{% endif %}
++            {% if current_extruder == 2 %}{% set p2 = False %}{% endif %}
++            {% if current_extruder == 3 %}{% set p3 = False %}{% endif %}
 +            SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=preheated_extruders VALUE="[{p0}, {p1}, {p2}, {p3}]"
              AUTO_FEEDING {rawparams} RESTORE_TEMP={restore_temp}
-+            {% if is_unload %}
-+                M104 S0 T{current_extruder} A0
-+            {% endif %}
++            M104 S0 T{current_extruder} A0
          {% endif %}
      {% else %}
          {% if doing == True %}

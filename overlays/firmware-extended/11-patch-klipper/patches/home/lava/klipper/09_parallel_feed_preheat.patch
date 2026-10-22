@@ -3,14 +3,14 @@ From: Simon-CR <cloutiersi@gmail.com>
 Date: Thu, 22 Oct 2026 14:35:00 +0000
 Subject: [PATCH] filament_feed: Add targeted parallel preheat and selective restore
 
-Pre-heats the unloading toolhead according to parallel_feed_preheat_temp
+Pre-heats the toolhead according to parallel_feed_preheat_temp
 before homing and toolhead switching, reducing filament swap time.
 Records initial toolhead target temperatures and selectively restores
 only toolheads that were preheated by this operation on cancel.
-Always cools unloaded toolhead to 0C on normal unload completion.
+Always cools toolhead to 0C on load/unload completion when idle.
 ---
- klippy/extras/filament_feed.py | 64 +++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 60 insertions(+), 4 deletions(-)
+ klippy/extras/filament_feed.py | 78 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 74 insertions(+), 4 deletions(-)
 
 --- a/klippy/extras/filament_feed.py
 +++ b/klippy/extras/filament_feed.py
@@ -41,7 +41,27 @@ Always cools unloaded toolhead to 0C on normal unload completion.
  
      def _do_feed(self, ch, action=None, stage=None, auto_mode=None):
          if ch < 0 or ch >= FEED_CHANNEL_NUMS or action == None:
-@@ -1284,6 +1297,19 @@
+@@ -991,7 +1004,12 @@
+                         self.exception_code[ch] = 33
+                         raise ValueError('logic error!')
+ 
+-                    self.gcode.run_script_from_command("M104 S%d T%d A0\r\n" % (filament_feed_temp - 70, self.filament_ch[ch]))
++                    ext_vars = self.printer.lookup_object('gcode_macro _EXTENDED_FEATURE_VARIABLES', None)
++                    if ext_vars and ext_vars.variables.get('parallel_feed_preheat', False):
++                        load_preheat_temp = int(ext_vars.variables.get('parallel_feed_preheat_temp', 130))
++                    else:
++                        load_preheat_temp = filament_feed_temp - 70
++                    self.gcode.run_script_from_command("M104 S%d T%d A0\r\n" % (load_preheat_temp, self.filament_ch[ch]))
+ 
+                     # home
+                     try:
+@@ -1280,2 +1298,3 @@
+                 finally:
+                     self.gcode.run_script_from_command("M107\r\n")
+-                    self.gcode.run_script_from_command("M104 S0\r\n")
++                    self.gcode.run_script_from_command("M104 S0 T%d A0\r\n" % (self.filament_ch[ch]))
++                    self._preheat_orig_targets.pop(self.filament_ch[ch], None)
+@@ -1284,6 +1303,19 @@
                      try:
                          # prepare
                          self._set_channel_state(ch, FEED_STA_UNLOAD_PREPARE, True)
@@ -61,7 +81,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
  
                          # home
                          try:
-@@ -1326,6 +1352,7 @@
+@@ -1326,6 +1358,7 @@
                      except:
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
@@ -69,7 +89,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL)
-@@ -1358,7 +1385,8 @@
+@@ -1358,7 +1391,8 @@
  
                          # finish
                          self.toolhead.wait_moves()
@@ -79,7 +99,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          self.channel_error[ch] = FEED_OK
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FINISH)
  
-@@ -1368,7 +1396,7 @@
+@@ -1368,7 +1402,7 @@
                      self.toolhead.wait_moves()
                      self.channel_error[ch] = FEED_OK
                      self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL, True)
@@ -88,7 +108,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                      if self.module_exist[ch] == True and self.config['auto_mode'][ch] == True:
                          if self._port[ch].get_filament_detected() == False:
                              self._set_channel_state(ch, FEED_STA_WAIT_INSERT)
-@@ -1379,6 +1407,19 @@
+@@ -1379,6 +1413,19 @@
                      try:
                          # prepare
                          self._set_channel_state(ch, FEED_STA_UNLOAD_PREPARE, True)
@@ -108,7 +128,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
  
                          # home
                          try:
-@@ -1433,7 +1474,8 @@
+@@ -1433,7 +1480,8 @@
                              raise ValueError('custom gcode error!')
  
                          self.toolhead.wait_moves()
@@ -118,7 +138,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          self.channel_error[ch] = FEED_OK
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FINISH)
  
-@@ -1443,7 +1485,7 @@
+@@ -1443,7 +1491,7 @@
                      except:
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
@@ -127,7 +147,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_UNLOAD_FAIL)
-@@ -1491,6 +1533,7 @@
+@@ -1491,6 +1539,7 @@
                          self.manual_feeding[ch] = False
                          self.toolhead.wait_moves()
                          self.channel_error_state[ch] = self.channel_state[ch]
@@ -135,7 +155,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_PREPARE_FAIL)
-@@ -1525,6 +1568,7 @@
+@@ -1525,6 +1574,7 @@
                          self.toolhead.wait_moves()
                          self.manual_feeding[ch] = False
                          self.channel_error_state[ch] = self.channel_state[ch]
@@ -143,7 +163,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_EXTRUDE_FAIL)
-@@ -1550,6 +1594,7 @@
+@@ -1550,6 +1600,7 @@
                          self.toolhead.wait_moves()
                          self.manual_feeding[ch] = False
                          self.channel_error_state[ch] = self.channel_state[ch]
@@ -151,7 +171,7 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                          if self.channel_error[ch] == FEED_OK:
                              self.channel_error[ch] = FEED_ERR
                          self._set_channel_state(ch, FEED_STA_MANUAL_FLUSH_FAIL)
-@@ -1591,6 +1636,7 @@
+@@ -1591,6 +1642,7 @@
                          self.toolhead.wait_moves()
                      except:
                          logging.error("[feed][manual] stage: cancel, gcode error!\r\n")
@@ -159,5 +179,15 @@ Always cools unloaded toolhead to 0C on normal unload completion.
                      self._set_channel_state(ch, FEED_STA_MANUAL_FAIL, True)
                      self.channel_error_state[ch] = self.channel_state[ch]
  
+@@ -1866,2 +1918,4 @@
+                         self.gcode.run_script_from_command(f"M104 S{last_temp} T{self.filament_ch[channel]} A0")
++                else:
++                    self.gcode.run_script_from_command(f"M104 S0 T{self.filament_ch[channel]} A0\r\n")
+                 if filament_entangle_detect is not None:
+@@ -1938,2 +1992,4 @@
+                         self.gcode.run_script_from_command(f"M104 S{last_temp} T{self.filament_ch[channel]} A0")
++                else:
++                    self.gcode.run_script_from_command(f"M104 S0 T{self.filament_ch[channel]} A0\r\n")
+                 if filament_entangle_detect is not None:
 -- 
 2.47.3
