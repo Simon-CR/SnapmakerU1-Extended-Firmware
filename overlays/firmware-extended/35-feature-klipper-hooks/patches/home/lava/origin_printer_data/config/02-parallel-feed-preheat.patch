@@ -1,6 +1,6 @@
 --- a/fluidd.cfg
 +++ b/fluidd.cfg
-@@ -1668,45 +1668,93 @@
+@@ -1668,45 +1668,106 @@
  variable_extruder1_temp: 0
  variable_extruder2_temp: 0
  variable_extruder3_temp: 0
@@ -20,7 +20,13 @@
 -        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=extruder1_temp VALUE={printer['extruder1'].target}
 -        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=extruder2_temp VALUE={printer['extruder2'].target}
 -        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=extruder3_temp VALUE={printer['extruder3'].target}
-+        {% set cur_targets = [printer['extruder'].target, printer['extruder1'].target, printer['extruder2'].target, printer['extruder3'].target] %}
++        {% set raw_targets = [printer['extruder'].target | int, printer['extruder1'].target | int, printer['extruder2'].target | int, printer['extruder3'].target | int] %}
++        {% set cur_targets = [
++            0 if (raw_targets[0] == preheat_temp or raw_targets[0] in [130, 150, 170]) else raw_targets[0],
++            0 if (raw_targets[1] == preheat_temp or raw_targets[1] in [130, 150, 170]) else raw_targets[1],
++            0 if (raw_targets[2] == preheat_temp or raw_targets[2] in [130, 150, 170]) else raw_targets[2],
++            0 if (raw_targets[3] == preheat_temp or raw_targets[3] in [130, 150, 170]) else raw_targets[3]
++        ] %}
 +        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=orig_targets VALUE="{cur_targets}"
 +        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=extruder0_temp VALUE={cur_targets[0]}
 +        SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=extruder1_temp VALUE={cur_targets[1]}
@@ -75,21 +81,32 @@
 +                    {% if next_extruder == 3 %}{% set p3 = True %}{% endif %}
 +                {% endif %}
 +            {% else %}
-+                AUTO_FEEDING_PREHEAT EXTRUDER={current_extruder}
-+                {% if params.NEXT_EXTRUDER is defined %}
-+                    {% set next_extruder = params.NEXT_EXTRUDER | default(default_extruder) | int %}
-+                    AUTO_FEEDING_PREHEAT EXTRUDER={next_extruder}
+                 AUTO_FEEDING_PREHEAT EXTRUDER={current_extruder}
+                 {% if params.NEXT_EXTRUDER is defined %}
+                     {% set next_extruder = params.NEXT_EXTRUDER | default(default_extruder) | int %}
+                     AUTO_FEEDING_PREHEAT EXTRUDER={next_extruder}
 +                    {% if next_extruder == 0 %}{% set p0 = True %}{% endif %}
 +                    {% if next_extruder == 1 %}{% set p1 = True %}{% endif %}
 +                    {% if next_extruder == 2 %}{% set p2 = True %}{% endif %}
 +                    {% if next_extruder == 3 %}{% set p3 = True %}{% endif %}
-+                {% endif %}
-             {% endif %}
+                 {% endif %}
 -            {% set extruder_temps = [extruder0_temp, extruder1_temp, extruder2_temp, extruder3_temp] %}
 -            {% set restore_temp = extruder_temps[current_extruder] %}
++            {% endif %}
++            {% set is_unload = params.UNLOAD | default(0) | int == 1 %}
++            {% set raw_restore = orig_targets[current_extruder] | default(0) | int %}
++            {% set restore_temp = 0 if is_unload else (0 if (raw_restore == preheat_temp or raw_restore in [130, 150, 170]) else raw_restore) %}
++            {% if is_unload %}
++                {% if current_extruder == 0 %}{% set p0 = False %}{% endif %}
++                {% if current_extruder == 1 %}{% set p1 = False %}{% endif %}
++                {% if current_extruder == 2 %}{% set p2 = False %}{% endif %}
++                {% if current_extruder == 3 %}{% set p3 = False %}{% endif %}
++            {% endif %}
 +            SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=preheated_extruders VALUE="[{p0}, {p1}, {p2}, {p3}]"
-+            {% set restore_temp = orig_targets[current_extruder] %}
              AUTO_FEEDING {rawparams} RESTORE_TEMP={restore_temp}
++            {% if is_unload %}
++                M104 S0 T{current_extruder} A0
++            {% endif %}
          {% endif %}
      {% else %}
          {% if doing == True %}
@@ -106,7 +123,9 @@
 -            {% endif %}
 +            {% for i in range(4) %}
 +                {% if preheated_extruders[i] %}
-+                    M104 S{orig_targets[i]} T{i} A0
++                    {% set raw_target = orig_targets[i] | int %}
++                    {% set target_to_restore = 0 if (raw_target == preheat_temp or raw_target in [130, 150, 170]) else raw_target %}
++                    M104 S{target_to_restore} T{i} A0
 +                {% endif %}
 +            {% endfor %}
              SET_GCODE_VARIABLE MACRO=AUTO_FEEDING_BATCH VARIABLE=doing VALUE=False
